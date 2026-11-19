@@ -139,6 +139,14 @@ $(B)/obj/tools/gamelib_entry.o: tools/gamelib_entry.c $(GAMELIB_SRCS) $(wildcard
 	@mkdir -p $(dir $@)
 	$(CC) $(GENFLAGS) -DGAMELIB_ID='"$(GAMELIB_ID)"' -DGAMELIB_MODULES='$(foreach m,$(GEN_MODS),X($(m)))' -c $< -o $@
 $(B)/rt/gamelib.o: $(GAMELIB_SRCS) Makefile  # (GAMELIB_ID is computed there)
+# PREP_ID: what a prepared shader cache is made by - the shader translator, the SPIR-V compile and its pack, and the
+# list of shaders prepared (runtime/nvn/vulkan/device.c prep_identity, with its own PREP_REV). The preparation was
+# due again after every update (the version number): ~1 minute on a fast PC, ~8 on a Steam Deck, mostly for nothing.
+PREP_SRCS := runtime/nvn/maxwell/translate.c runtime/nvn/maxwell/shader.h runtime/nvn/vulkan/shaders.c \
+             runtime/nvn/vulkan/known_programs.txt
+PREP_ID := $(shell cat $(PREP_SRCS) | tr -d '\015' | (shasum -a 256 2>/dev/null || sha256sum) | cut -c1-12)
+$(B)/rt/nvn/vulkan/device.o: $(PREP_SRCS)
+$(B)/rt/nvn/vulkan/device.o: RTFLAGS += -DPREP_ID='"$(PREP_ID)"'
 $(B)/rt/gamelib.o: RTFLAGS += -DGAMELIB_ID='"$(GAMELIB_ID)"'
 # the setup page's build of it on the player's machine (runtime/gamebuild.c) uses the same flags
 $(B)/rt/gamebuild.o: $(GAMELIB_SRCS) Makefile

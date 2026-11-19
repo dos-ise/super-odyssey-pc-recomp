@@ -191,8 +191,23 @@ bool input_pointer_layout(float *x, float *y) {
     *x = atomic_load(&pointer_lx), *y = atomic_load(&pointer_ly);
     return true;
 }
-// The system pointer shown over the game (runtime/ui/menu.mm): in its menus, where the pointer isn't held
-bool input_pointer_visible(void) { return !atomic_load(&mouse_held) && in_game_menu(); }
+// Which device was used last for pointing: a controller (or the keyboard) press hides the game menus' pointer until the
+// mouse moves, clicks or scrolls again. Hidden at the start (it shows on the first mouse use). The settings menu (F1)
+// draws its own pointer regardless (runtime/ui/menu.mm).
+static _Atomic bool pointer_pad_last = true;
+static _Atomic uint64_t pointer_mode_ns;  // when the pointer was last held / freed (the warp back isn't a mouse use)
+static void pointer_note_device(bool is_pad) {
+    if (atomic_load(&pointer_pad_last) == is_pad) return;
+    atomic_store(&pointer_pad_last, is_pad);
+    static int lm = -1;
+    if (lm < 0) lm = getenv("ODYSSEY_LOG_MOUSE") != NULL;
+    if (lm) LOG("[input] menu pointer: %s\n", is_pad ? "hidden (controller / keys)" : "shown (mouse)");
+}
+// The system pointer shown over the game (runtime/ui/menu.mm): in its menus, where the pointer isn't held, and only
+// while the mouse is the device in use
+bool input_pointer_visible(void) {
+    return !atomic_load(&mouse_held) && !atomic_load(&pointer_pad_last) && in_game_menu();
+}
 // A wheel notch (0 up, 1 down): one D-pad step in a menu, if the wheel isn't bound to anything
 static void menu_wheel_notch(int down) {
     if (mouse_code_bound(down ? BIND_WHEEL_DOWN : BIND_WHEEL_UP) || !in_game_menu()) return;
@@ -395,6 +410,7 @@ void input_mouse_window(SDL_Window *w) {
     }
     mouse_held = want;
     mouse_forget();
+    atomic_store(&pointer_mode_ns, plat_now_ns());
     static int nlog;
     if (nlog++ < 8) LOG("[input] mouse camera: pointer %s\n", want ? "held (moves the camera)" : "free");
 }
@@ -820,7 +836,7 @@ void input_handle_event(const SDL_Event *e) {
         if (e->type == SDL_EVENT_KEY_DOWN && !e->key.repeat &&
             !(e->key.scancode >= SDL_SCANCODE_LCTRL && e->key.scancode <= SDL_SCANCODE_RGUI) &&
             !(e->key.scancode >= SDL_SCANCODE_F1 && e->key.scancode <= SDL_SCANCODE_F12))
-            kbprompts_note_device(true);
+            kbprompts_note_device(true), pointer_note_device(true);
         if (e->type == SDL_EVENT_KEY_DOWN && e->key.scancode == SDL_SCANCODE_F9 && !e->key.repeat) g_debug_frame_request = 1;
         if (e->key.scancode < SDL_SCANCODE_COUNT) keys_down[e->key.scancode] = e->type == SDL_EVENT_KEY_DOWN;
         recompute_keyboard();
@@ -855,6 +871,7 @@ void input_handle_event(const SDL_Event *e) {
         if ((!pad || SDL_GetGamepadID(pad) != e->gbutton.which) && !input_cappy_assigned())
             use_pad(SDL_GetGamepadFromID(e->gbutton.which));
         kbprompts_note_device(false);
+        pointer_note_device(true);
         // SDL's live state may already contain the release when its queued press is handled.
         if (pad && SDL_GetGamepadID(pad) == e->gbutton.which) {
             uint64_t buttons = 0;
@@ -864,7 +881,8 @@ void input_handle_event(const SDL_Event *e) {
         }
         // Fall through to refresh the live state and sticks.
     case SDL_EVENT_GAMEPAD_AXIS_MOTION: case SDL_EVENT_GAMEPAD_BUTTON_UP:
-        if (e->type == SDL_EVENT_GAMEPAD_AXIS_MOTION && abs(e->gaxis.value) > 16000) kbprompts_note_device(false);
+        if (e->type == SDL_EVENT_GAMEPAD_AXIS_MOTION && abs(e->gaxis.value) > 16000)
+            kbprompts_note_device(false), pointer_note_device(true);
         recompute_pad();
         {   // the shake button (Controls: "Shake button"): held -> the game sees a shaken controller (hid_sixaxis_states)
             int b = g_settings.motion_shake_pad;
@@ -878,14 +896,20 @@ void input_handle_event(const SDL_Event *e) {
         }
         break;
     case SDL_EVENT_MOUSE_MOTION:
-        if (!mouse_held) pointer_motion(SDL_GetWindowFromID(e->motion.windowID), e->motion.x, e->motion.y);
+        if (!mouse_held) {
+            pointer_motion(SDL_GetWindowFromID(e->motion.windowID), e->motion.x, e->motion.y);
+            // a real move (not a jitter, nor SDL putting the pointer back when it was freed): the mouse is in use
+            if (fabsf(e->motion.xrel) + fabsf(e->motion.yrel) > 2 &&
+                plat_now_ns() - atomic_load(&pointer_mode_ns) > 150000000ull)
+                pointer_note_device(false);
+        }
         if (mouse_held) {
             mouse_add(e->motion.xrel, e->motion.yrel);
             if (fabsf(e->motion.xrel) + fabsf(e->motion.yrel) > 2) kbprompts_note_device(true);  // (not a jitter)
         }
         break;
     case SDL_EVENT_MOUSE_BUTTON_DOWN: case SDL_EVENT_MOUSE_BUTTON_UP:  // (bound like keys: input_bind.h)
-        if (e->type == SDL_EVENT_MOUSE_BUTTON_DOWN) kbprompts_note_device(true);
+        if (e->type == SDL_EVENT_MOUSE_BUTTON_DOWN) kbprompts_note_device(true), pointer_note_device(false);
         if (e->button.button >= SDL_BUTTON_LEFT && e->button.button <= SDL_BUTTON_X2) {
             keys_down[BIND_MOUSE_LEFT + e->button.button - SDL_BUTTON_LEFT] = e->type == SDL_EVENT_MOUSE_BUTTON_DOWN;
             recompute_keyboard();
@@ -899,6 +923,7 @@ void input_handle_event(const SDL_Event *e) {
             menu_wheel_notch(!up);
             recompute_keyboard();
             kbprompts_note_device(true);
+            pointer_note_device(false);
         }
         break;
     case SDL_EVENT_WINDOW_FOCUS_LOST:

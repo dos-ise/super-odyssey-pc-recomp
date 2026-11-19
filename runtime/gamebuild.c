@@ -268,6 +268,7 @@ typedef struct {
     unsigned long long bytes;
     bool generated;  // (deleted once compiled; the entry file is the shipped one)
     bool started;
+    int longest;     // its longest function, in lines (generated files; 0 otherwise)
 } Unit;
 
 typedef struct {
@@ -275,6 +276,7 @@ typedef struct {
     int n, cap;
 } Units;
 
+static int longest_function(const char *path);
 static void add_unit(Units *us, const char *src, const char *work, const char *stem, bool generated) {
     if (us->n == us->cap) {
         us->cap = us->cap ? us->cap * 2 : 64;
@@ -288,6 +290,7 @@ static void add_unit(Units *us, const char *src, const char *work, const char *s
     u->started = false;
     struct stat st;
     u->bytes = stat(src, &st) == 0 ? (unsigned long long)st.st_size : 0;
+    u->longest = generated ? longest_function(src) : 0;
 }
 
 // The flags the game code was built with (GAMELIB_CFLAGS, part of its id). zig cc reads -march=<cpu> with its own CPU
@@ -356,7 +359,18 @@ static PlatProc start_compile(const Tools *t, const Unit *u, bool entry) {
     // A file holding a giant function (over 3,000 lines: about 60 of the ~500, mostly system codecs and the video
     // decoder) without LICM's promotion: on those it alone took many minutes per file (sdk_053: 13 min, 104 s
     // without it, on a Steam Deck). The rest keep it - it keeps guest registers in host ones in loops.
-    if (t->zig && u->generated && longest_function(u->src) > 3000) add(&a, "-mllvm"), add(&a, "-disable-licm-promotion");
+    // Two more for those files (2026-11-18, clang -ftime-report on the slowest, subsdk0_139 - one 15,000-line function of
+    // the video decoder: 57 s alone on a Ryzen 9950X3D, 27 s of it in the register coalescer and 21 s in the SLP
+    // vectorizer): global copies are not joined (the object came out 2.6% smaller, not larger) and no SLP
+    // vectorization (the same object with and without). 57 s -> 14 s for that file, 58 -> 24 and 19 -> 8 for the next
+    // two of the decoder; the whole build waited for these while every other file was done.
+    // ODYSSEY_GAME_SLOW_FLAGS=1: without the two (tests).
+    static int slow_flags = -1;
+    if (slow_flags < 0) slow_flags = getenv("ODYSSEY_GAME_SLOW_FLAGS") != NULL;
+    if (t->zig && u->generated && u->longest > 3000) {
+        add(&a, "-mllvm"), add(&a, "-disable-licm-promotion");
+        if (!slow_flags) add(&a, "-mllvm"), add(&a, "-join-globalcopies=false"), add(&a, "-fno-slp-vectorize");
+    }
     char inc[1200];
     snprintf(inc, sizeof inc, "-I%s", t->inc);
     add(&a, inc);
@@ -500,10 +514,21 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
         // waiting goes first: a few files hold enormous functions (7,000-10,000 lines) that take many minutes alone,
         // and started late they were the whole build's tail (the generator itself takes seconds, so they're all
         // waiting soon). next: the files started so far.
+        // Files with a giant function before all others, the longest function first: the file's size does not tell -
+        // main_092 (1.4.1) is 224 KB, one 3,900-line function, and takes 90 s alone on a Ryzen 9950X3D and 264 s on
+        // a Steam Deck (the loop passes); by size it started among the last and the whole build then waited for it
+        // with every other core idle. ODYSSEY_GAME_ORDER_OLD=1: by size only, as before (tests).
+        static int order_old = -1;
+        if (order_old < 0) order_old = getenv("ODYSSEY_GAME_ORDER_OLD") != NULL;
         while (nrun < jobs) {
             int pick = -1;
-            for (int k = 1; k < units.n; k++)
-                if (!units.u[k].started && (pick < 0 || units.u[k].bytes > units.u[pick].bytes)) pick = k;
+            for (int k = 1; k < units.n; k++) {
+                if (units.u[k].started) continue;
+                if (pick < 0) { pick = k; continue; }
+                int gk = !order_old && units.u[k].longest > 3000 ? units.u[k].longest : 0;
+                int gp = !order_old && units.u[pick].longest > 3000 ? units.u[pick].longest : 0;
+                if (gk != gp ? gk > gp : units.u[k].bytes > units.u[pick].bytes) pick = k;
+            }
             if (pick < 0) break;
             PlatProc p = start_compile(&t, &units.u[pick], false);
             if (!p) { snprintf(why, why_size, "the compiler didn't start"); ok = false; break; }

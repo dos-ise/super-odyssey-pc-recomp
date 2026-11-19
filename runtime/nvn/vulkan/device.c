@@ -2194,10 +2194,25 @@ void vk_prepare_request(bool on) {
 // Whether this start has a full preparation due (vk_prepare_before_start's checks, without doing it): the configuration
 // page (runtime/ui/setup.mm) asks the player then and runs it on its own page, with a progress bar.
 static bool g_prepare_skipped;  // (the player said Later: not this start)
-// What a prepared cache was made for: the GPU, its driver and this program's version (the PREPARED_MARK's second
-// line). A driver update makes the driver refuse the saved pipeline binaries, and a new version may translate shaders
-// differently: either way the cache no longer matches and every effect would build while playing - the stutters
-// players saw after updating. A different identity (or a mark from before it was kept) makes the preparation due again.
+// What a prepared cache was made for: the GPU, its driver and what makes the shaders (the PREPARED_MARK's second
+// line). A driver update makes the driver refuse the saved pipeline binaries, and a changed translator makes other
+// shaders: either way the cache no longer matches and every effect would build while playing - the stutters players
+// saw after updating. A different identity (or a mark from before it was kept) makes the preparation due again.
+// Until 0.4.7 the identity held the program's version, so every update prepared everything again - 65 s on an RTX
+// 4090 with every cache warm, ~8 minutes on a Steam Deck (the owner's, 0.4.2 -> 0.4.5) - although most updates
+// change nothing a shader is made from. Now: PREP_ID (the Makefile's hash of the translator, the SPIR-V compile and
+// pack, and the list of prepared shaders) and PREP_REV below.
+// PREP_REV: raise it with any change, outside PREP_ID's files, to what the preparation makes or to how the game then
+// looks it up - the pipeline libraries' creation (exec.c), the pipeline binaries / pipeline cache format, the
+// recorded pipeline states. Forgetting it costs first-use compiles while playing (draws wait a few frames), not a
+// wrong picture.
+#ifndef PREP_ID
+#define PREP_ID "dev"
+#endif
+#define PREP_REV 1
+// (a mark written the old way for the same shader sources: {PREP_ID "." PREP_REV, its "app <version>"} - 0.4.7 was
+// released from these sources, so its players are not prepared once more; void as soon as either changes)
+static const char *const prep_same_as[][2] = {{"50739c27e9a1.1", "0.4.7"}};
 static void prep_identity(char out[128]) {
     static char id[128];
     static bool done;
@@ -2227,8 +2242,8 @@ static void prep_identity(char out[128]) {
             }
         }
         if (best.vendorID)
-            snprintf(id, sizeof id, "gpu %04x:%04x driver %u app %s pbin %d", best.vendorID, best.deviceID, best.driverVersion,
-                     APP_VERSION, pbin_wanted(best.vendorID));
+            snprintf(id, sizeof id, "gpu %04x:%04x driver %u shaders %s.%d pbin %d", best.vendorID, best.deviceID, best.driverVersion,
+                     PREP_ID, PREP_REV, pbin_wanted(best.vendorID));
     }
     memcpy(out, id, 128);
 }
@@ -2263,7 +2278,16 @@ static bool prepare_due(bool log, char key[64]) {
             if (fgets(line, sizeof line, f) && fgets(have_id, sizeof have_id, f)) have_id[strcspn(have_id, "\r\n")] = 0;
             fclose(f);
         }
-        if (!want[0] || !strcmp(have_id, want)) {
+        bool same = !want[0] || !strcmp(have_id, want);
+        for (size_t i = 0; !same && i < sizeof prep_same_as / sizeof prep_same_as[0]; i++) {
+            char now[40], old[160], *sh = strstr(want, " shaders ");
+            snprintf(now, sizeof now, "%s.%d", PREP_ID, PREP_REV);
+            if (!sh || strcmp(now, prep_same_as[i][0])) continue;
+            const char *pb = strstr(sh, " pbin ");
+            snprintf(old, sizeof old, "%.*s app %s%s", (int)(sh - want), want, prep_same_as[i][1], pb ? pb : "");
+            same = !strcmp(have_id, old);
+        }
+        if (same) {
             if (log) LOG("[prep] shader cache found; using quick startup\n");
             return false;
         }

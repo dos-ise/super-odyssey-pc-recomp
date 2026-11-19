@@ -321,6 +321,12 @@ static bool fog_f16_map_reader(uint64_t lr) {
     return main && !memcmp(main->build_id, v100, sizeof v100);
 }
 
+// ODYSSEY_PAINT_PRIO=0: paint map asks and CPU-edit hand-backs wait behind everything queued, as before (rqueue.c rq_ask)
+static bool paint_prio_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("ODYSSEY_PAINT_PRIO"); on = !e || atoi(e) != 0; }
+    return on;
+}
 static void paint_sync_rows(uint64_t td, bool refresh, unsigned reader) {
     if (td < GUEST_LO || td >= GUEST_HI - 0x50) return;
     uint64_t pool = G(uint64_t, td, 0), off = G(uint32_t, td, 8);
@@ -329,27 +335,88 @@ static void paint_sync_rows(uint64_t td, bool refresh, unsigned reader) {
     if (!p || off >= p->size) return;
     uint64_t capacity = p->size - off;
     if (capacity > 4 * 1024 * 1024) capacity = 4 * 1024 * 1024;
-    void *snapshot = malloc(capacity);
     // (the copy the rows at an address hold: asked again within a frame, the renderer returns "unchanged" and
     // nothing is copied - a CPU edit handed back, or a refresh, makes a new copy with a new number)
-    static struct { uint64_t addr, gen; } held[8];
+    static struct { uint64_t addr, gen, ticket; } held[8];
     static unsigned held_next;
     int hi = -1;
     for (int i = 0; i < 8; i++) if (held[i].addr == p->storage + off) hi = i;
+    // Nothing has been handed to the render thread since the last ask about this map: nothing can have written it, the
+    // rows are still the map - no ask at all. PaintObj's attack sensor asks ~39 times a frame, in a row, and each ask
+    // waited for the render thread to reach it behind the frame's draw lists. On a Steam Deck that kept the game
+    // thread just over a frame's time in the Wooded Kingdom's poison (the owner's recording: 28-61 FPS, mostly
+    // 35-55), and under 60 the game runs extra ticks to keep its speed, which costs still more.
+    // ODYSSEY_PAINT_TICKET=0: every ask goes to the render thread, as before. ODYSSEY_PAINT_SYNC_VERIFY=1: it goes
+    // there all the same and must come back "unchanged".
+    static int ticket_on = -1, ticket_verify = -1;
+    static uint64_t tk_skipped, tk_asked, tk_wrong, tk_log;
+    if (ticket_on < 0) { const char *e = getenv("ODYSSEY_PAINT_TICKET"); ticket_on = !e || atoi(e) != 0; }
+    if (ticket_verify < 0) ticket_verify = getenv("ODYSSEY_PAINT_SYNC_VERIFY") != NULL;
+    bool same_queue = ticket_on && rq_enabled() && !refresh && hi >= 0 && held[hi].gen && held[hi].ticket &&
+                      rq_last_ticket() == held[hi].ticket;
+    if (same_queue && !ticket_verify) { tk_skipped++; return; }
+    // (allocated only now. 0.4.8 allocated it above and returned here without freeing it: up to 4 MB at each ask left
+    // out, ~39 a frame near poison - never touched, so not in RAM, but committed: 22 -> 57 GB in three minutes in the
+    // Wooded Kingdom on a 16 GB PC, then "out of host memory for commands" (#75, crash report 2026-11-19))
+    void *snapshot = malloc(capacity);
     RqCpuTexel q = {.addr = p->storage + off, .components = 1, .component_bytes = 4,
         .snapshot = snapshot, .snapshot_capacity = capacity, .guest_capacity = p->size - off,
         .guest_pitch = G(uint32_t, td, 0x4c), .refresh_snapshot = refresh, .have_gen = hi >= 0 && !refresh ? held[hi].gen : 0};
+    uint64_t ticket = 0;
 #ifndef __APPLE__
     if (snapshot) {
-        if (rq_enabled()) rq_wait(rq_push(RQ_CPU_TEXEL, &q, 0));
+        if (rq_enabled() && paint_prio_on()) {
+            if (ticket_verify) q.have_gen = 0;  // (the bytes themselves, to compare below)
+            ticket = rq_ask(RQ_CPU_TEXEL, &q);
+            if (ticket_verify) {  // (the same ask behind everything queued, as before: it must return the same map)
+                static uint64_t pv_same, pv_diff, pv_n;
+                void *snap2 = malloc(capacity);
+                RqCpuTexel q2 = {.addr = p->storage + off, .components = 1, .component_bytes = 4, .snapshot = snap2,
+                    .snapshot_capacity = capacity, .guest_capacity = p->size - off, .guest_pitch = G(uint32_t, td, 0x4c),
+                    .refresh_snapshot = refresh};
+                if (snap2) {
+                    rq_wait(rq_push(RQ_CPU_TEXEL, &q2, 0));
+                    uint64_t n = (uint64_t)q.snapshot_width * 4 * q.snapshot_height;
+                    bool same = q.valid == q2.valid && (!q.valid || (q.snapshot_width == q2.snapshot_width &&
+                                q.snapshot_height == q2.snapshot_height && n <= capacity && !q.unchanged && !q2.unchanged && !memcmp(snapshot, snap2, n)));
+                    if (same) pv_same++;
+                    else if (pv_diff++ < 40) {
+                        uint64_t nd = 0, first = 0;
+                        if (q.valid && q2.valid && n <= capacity)
+                            for (uint64_t k = 0; k < n; k++) if (((uint8_t *)snapshot)[k] != ((uint8_t *)snap2)[k]) { if (!nd) first = k; nd++; }
+                        LOG("[paint-verify] DIFFERENT (the ask ahead of the queue): %llx reader %u refresh %d valid %d/%d unchanged %d/%d gen %llu/%llu %ux%u, %llu bytes differ (first at %llu), ticket %llu, queue now %llu | ahead: path %u writes %u kept %u frame %llu | behind: path %u writes %u kept %u frame %llu\n",
+                            (unsigned long long)q.addr, reader, refresh, q.valid, q2.valid, q.unchanged, q2.unchanged, (unsigned long long)q.gen, (unsigned long long)q2.gen,
+                            q.snapshot_width, q.snapshot_height, (unsigned long long)nd, (unsigned long long)first, (unsigned long long)ticket, (unsigned long long)rq_last_ticket(),
+                            q.dbg_path, q.dbg_wgen, q.dbg_wseq, (unsigned long long)q.dbg_frame, q2.dbg_path, q2.dbg_wgen, q2.dbg_wseq, (unsigned long long)q2.dbg_frame);
+                    }
+                    if (++pv_n % 2000 == 0)
+                        LOG("[paint-verify] asks ahead of the queue: %llu the same map as behind it, %llu different\n",
+                            (unsigned long long)pv_same, (unsigned long long)pv_diff);
+                    free(snap2);
+                }
+            }
+        } else if (rq_enabled()) { ticket = rq_push(RQ_CPU_TEXEL, &q, 0); rq_wait(ticket); }
         else { extern void renderer_cpu_texel(RqCpuTexel *); renderer_cpu_texel(&q); }
     }
 #endif
+    tk_asked++;
+    if (same_queue && !(q.valid && q.unchanged)) {  // (verify: the ask that would have been left out found a change)
+        if (tk_wrong++ < 8) LOG("[paint-verify] DIFFERENT (no ask since the queue stood still): %llx valid %d unchanged %d\n",
+                                (unsigned long long)q.addr, q.valid, q.unchanged);
+    }
+    if (ticket_verify && (tk_asked % 20000) == 0)
+        LOG("[paint-verify] asks the standing queue would leave out: %llu wrong so far\n", (unsigned long long)tk_wrong);
     bool stored = q.valid && (q.unchanged || nvn_linear_store_rows((void *)(uintptr_t)q.addr, q.guest_capacity, q.guest_pitch,
         snapshot, capacity, (uint64_t)q.snapshot_width * 4, q.snapshot_height));
     if (stored && !q.unchanged) {
         if (hi < 0) hi = (int)(held_next++ % 8);
         held[hi].addr = q.addr, held[hi].gen = q.gen;
+    }
+    if (hi >= 0) held[hi].ticket = stored ? ticket : 0;  // (the rows are the map as of this ask - or not known)
+    if (getenv("ODYSSEY_LOG_PAINT_SYNC") && tk_asked - tk_log >= 2000) {
+        tk_log = tk_asked;
+        LOG("[paint-sync] asks: %llu sent to the render thread, %llu left out (nothing queued since the last)\n",
+            (unsigned long long)tk_asked, (unsigned long long)tk_skipped);
     }
     if (stored) p->paint_cpu_shared = true;
     static unsigned counts[4];
@@ -411,7 +478,25 @@ NVN(nvnMemoryPoolMap) {
             RqCpuTexel q = {.addr = p->storage + off, .x = x, .y = y, .components = 1, .component_bytes = 4};
 #ifndef __APPLE__
             if (valid && (paint_feedback || count <= 64 || !(count % 2000))) {
-                if (rq_enabled()) rq_wait(rq_push(RQ_CPU_TEXEL, &q, 0));
+                // (ahead of what is queued, as the row asks - rq_ask: behind everything, each of these single texel reads
+                // waited for the render thread to finish the frame's lists - 12% of the game thread's time in the
+                // slowest stretch of the owner's Wooded Kingdom recording on a Steam Deck)
+                if (rq_enabled() && !rq_on_thread() && paint_prio_on()) {
+                    rq_ask(RQ_CPU_TEXEL, &q);
+                    static int verify = -1;
+                    if (verify < 0) verify = getenv("ODYSSEY_PAINT_SYNC_VERIFY") != NULL;
+                    if (verify) {  // (the same ask behind everything queued must give the same texel)
+                        static uint64_t same, diff;
+                        RqCpuTexel q2 = {.addr = q.addr, .x = x, .y = y, .components = 1, .component_bytes = 4};
+                        rq_wait(rq_push(RQ_CPU_TEXEL, &q2, 0));
+                        if (q.valid == q2.valid && (!q.valid || q.value == q2.value)) same++;
+                        else if (diff++ < 16) LOG("[paint-verify] DIFFERENT (a texel asked ahead of the queue): %llx %u,%u valid %d/%d %08x/%08x\n",
+                                                  (unsigned long long)q.addr, x, y, q.valid, q2.valid, q.value, q2.value);
+                        if ((same + diff) % 2000 == 0)
+                            LOG("[paint-verify] texels asked ahead of the queue: %llu the same as behind it, %llu different\n",
+                                (unsigned long long)same, (unsigned long long)diff);
+                    }
+                } else if (rq_enabled()) rq_wait(rq_push(RQ_CPU_TEXEL, &q, 0));
                 else { extern void renderer_cpu_texel(RqCpuTexel *); renderer_cpu_texel(&q); }
             }
 #endif
@@ -491,8 +576,12 @@ NVN(nvnMemoryPoolFlushMappedRange) {
     NvnPool *p = HOST(NvnPool, A(0));
 #ifndef __APPLE__
     if (p->paint_cpu_shared && A(1) <= p->size && A(2) <= p->size - A(1)) {
-        RqPaintWrite w = {p->storage + A(1), A(2)};
-        if (rq_enabled() && !rq_on_thread()) rq_wait(rq_push(RQ_PAINT_WRITE, &w, 0));
+        RqPaintWrite w = {p->storage + A(1), A(2), 0};
+        // (not waited for: it runs in its place in the queue, and the next ask about the map is not run before it
+        // and its upload - rq_ask. Waiting made the game thread wait for the whole queue again.)
+        RqPaintWrite *hw = rq_enabled() && !rq_on_thread() && paint_prio_on() && getenv("ODYSSEY_PAINT_SYNC_VERIFY") == NULL ? malloc(sizeof *hw) : NULL;
+        if (hw) { *hw = w; hw->heap = 1; rq_push(RQ_PAINT_WRITE, hw, 0); }
+        else if (rq_enabled() && !rq_on_thread()) rq_wait(rq_push(RQ_PAINT_WRITE, &w, 0));
         else { extern void renderer_paint_cpu_written(uint64_t, uint64_t); renderer_paint_cpu_written(w.addr, w.size); }
     }
 #endif
@@ -757,13 +846,17 @@ static uint64_t tex_desc_hash(const NvnTexture *t) {
 }
 
 // The host texture with n's description (n freed), or n itself, new. One more initialization of it.
-static _Atomic uint64_t g_tex_inits;  // (texture initializations so far: textures.c vk_tex_prefetch skips its scan when none)
+// (host textures that are new or came back into use so far: textures.c vk_tex_prefetch skips its scan when none, and
+// tex_trace_find keeps its answers. Not every initialization: Odyssey initializes textures it already has at every
+// frame - the same description, the same host texture - and counting those meant neither ever held, a walk of the
+// whole table at every present and at every fog / paint map read: 0.75% + 1.0% of the game's CPU time on a Steam
+// Deck in Cap Kingdom.)
+static _Atomic uint64_t g_tex_inits;
 uint64_t nvn_texture_inits(void) { return atomic_load(&g_tex_inits); }
 static NvnTexture *tex_by_desc(NvnTexture *n) {
-    atomic_fetch_add(&g_tex_inits, 1);
     static int off = -1;  // ODYSSEY_NO_TEX_DEDUP=1 (debug): every initialization its own host texture, as before
     if (off < 0) off = getenv("ODYSSEY_NO_TEX_DEDUP") != NULL;
-    if (off) { n->live = 1; tex_set_add(n); return n; }
+    if (off) { atomic_fetch_add(&g_tex_inits, 1); n->live = 1; tex_set_add(n); return n; }
     uint64_t h = tex_desc_hash(n);
     pthread_mutex_lock(&g_tex_lock);
     NvnTexture **head = &g_tex_desc[h & (TEX_DESC_BUCKETS - 1)], *t = *head;
@@ -774,6 +867,7 @@ static NvnTexture *tex_by_desc(NvnTexture *n) {
         t->desc_next = *head;
         *head = t;
     }
+    if (t == n || (t->live <= 0 && !t->backend)) atomic_fetch_add(&g_tex_inits, 1);  // (new, or back in use with nothing on the GPU)
     t->live++;
     t->release_at = 0;
     pthread_mutex_unlock(&g_tex_lock);
@@ -820,14 +914,18 @@ static void tex_process_releases(void) {
 
 // Live textures with guest storage the renderer hasn't touched yet (textures.c vk_tex_prefetch): up to max, a scan that
 // goes on where the last one stopped. (Textures are never freed, so the pointers stay valid.)
-int nvn_untouched_textures(NvnTexture **out, int max) {
+// max_bytes (0: any size): only textures whose storage is no larger - in play the prefetch leaves the large ones for
+// the next load, and returning them here kept its scan from ever finding "nothing to do": it walked part of the table
+// at every present (0.75% of the game's CPU time on a Steam Deck in Cap Kingdom).
+int nvn_untouched_textures(NvnTexture **out, int max, uint64_t max_bytes) {
     static size_t cursor;
     int n = 0;
     pthread_mutex_lock(&g_tex_lock);
     size_t k = 0;
     for (; g_tex_cap && k < g_tex_cap && n < max; k++) {
         NvnTexture *t = g_tex_set[(cursor + k) & (g_tex_cap - 1)];
-        if (t && !t->backend && !t->no_prefetch && t->live > 0 && t->addr && t->guest_obj && t->target != 10) out[n++] = t;
+        if (t && !t->backend && !t->no_prefetch && t->live > 0 && t->addr && t->guest_obj && t->target != 10 &&
+            (!max_bytes || !t->layout.fmt || tegra_total_size(&t->layout) <= max_bytes)) out[n++] = t;
     }
     cursor += k;
     pthread_mutex_unlock(&g_tex_lock);
@@ -836,6 +934,19 @@ int nvn_untouched_textures(NvnTexture **out, int max) {
 
 // (debug, ODYSSEY_TEX_TRACE) the most recently initialized host texture with that storage address
 NvnTexture *tex_trace_find(uint64_t addr) {
+    // (the fog and paint maps' CPU reads ask this several times a frame for the same few addresses, and each ask
+    // walked the whole texture table: 1.0% of the game's CPU time on a Steam Deck in Cap Kingdom. An answer holds
+    // while no texture has been initialized since - a newer one at that address would be the answer.)
+    static struct { uint64_t addr, inits; NvnTexture *t; } memo[8];
+    static unsigned memo_next;
+    uint64_t inits = atomic_load(&g_tex_inits);
+    // ODYSSEY_TEX_FIND_VERIFY=1 (tests): every kept answer is checked against a walk of the table
+    static int verify = -1;
+    if (verify < 0) verify = getenv("ODYSSEY_TEX_FIND_VERIFY") != NULL;
+    NvnTexture *kept = NULL;
+    for (int i = 0; i < 8; i++)
+        if (memo[i].t && memo[i].addr == addr && memo[i].inits == inits && memo[i].t->addr == addr && memo[i].t->backend) { kept = memo[i].t; break; }
+    if (kept && !verify) return kept;
     NvnTexture *best = NULL;
     pthread_mutex_lock(&g_tex_lock);
     for (size_t i = 0; i < g_tex_cap; i++) {
@@ -843,6 +954,17 @@ NvnTexture *tex_trace_find(uint64_t addr) {
         if (t && t->addr == addr && t->backend && (!best || t->debug_id > best->debug_id)) best = t;
     }
     pthread_mutex_unlock(&g_tex_lock);
+    if (verify && kept) {
+        static uint64_t same, diff;
+        if (kept == best) same++;
+        else if (diff++ < 12)
+            LOG("[tex-find] WRONG kept answer for %llx: texture %llu (%ux%u fmt %#x) kept, %llu (%ux%u fmt %#x) is the newest with a GPU copy\n",
+                (unsigned long long)addr, (unsigned long long)kept->debug_id, kept->width, kept->height, kept->format,
+                (unsigned long long)(best ? best->debug_id : 0), best ? best->width : 0, best ? best->height : 0, best ? best->format : 0);
+        if ((same + diff) % 2000 == 0) LOG("[tex-find] kept answers so far: %llu right, %llu wrong\n", (unsigned long long)same, (unsigned long long)diff);
+        return best;
+    }
+    if (best) { unsigned m = memo_next++ % 8; memo[m].addr = addr, memo[m].inits = inits, memo[m].t = best; }
     return best;
 }
 
