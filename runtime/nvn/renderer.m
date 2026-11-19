@@ -541,6 +541,8 @@ static id<MTLLibrary> clear_lib(int index) {
     return libs[index];
 }
 
+static int rt_kind(uint32_t f);  // (defined below; the clear shader is picked by the attachment format)
+
 static void attachment_formats(MTLRenderPipelineDescriptor *pd) {
     for (int i = 0; i < st.rt.ncolor; i++)
         if (st.rt.color[i]) pd.colorAttachments[i].pixelFormat = view_texture(st.rt.color[i], &st.rt.cview[i], st.rt.has_cview[i], true, nil).pixelFormat;
