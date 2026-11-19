@@ -167,6 +167,26 @@ static void end_pass(void) {
             snprintf(path, sizeof path, "build/pass_%03d_a.png", debug_pass_no++);
             renderer_save_texture_alpha(t, path);
         }
+        // ODYSSEY_SHOT_RT=<frame>: save the main scene render target (the first scalable 1600x900 target) once.
+        // Tells whether the 3D scene is black in its own render target or only after the copy into the window image.
+        static long shot_rt = -1;
+        if (shot_rt < 0) shot_rt = getenv("ODYSSEY_SHOT_RT") ? atol(getenv("ODYSSEY_SHOT_RT")) : 0;
+        extern uint64_t renderer_present_count(void);
+        if (shot_rt && renderer_present_count() == (uint64_t)shot_rt && st.rt.ncolor && st.rt.color[0] &&
+            st.rt.color[0]->backend) {
+            NvnTexture *t0 = st.rt.color[0];
+            float sx, sy;
+            renderer_texture_scale(t0, &sx, &sy);
+            if ((sx != 1 || sy != 1) && t0->width == 1600 && t0->height == 900) {
+                id<MTLTexture> t = renderer_texture(t0, nil, true);
+                id<MTLCommandBuffer> c = cmdbuf;
+                cmdbuf = nil;
+                [c commit];
+                [c waitUntilCompleted];
+                renderer_save_texture(t, getenv("ODYSSEY_SHOT_RT_PATH") ? getenv("ODYSSEY_SHOT_RT_PATH") : "build/rt.png");
+                shot_rt = 0;  // once
+            }
+        }
     }
 }
 
@@ -541,6 +561,12 @@ static void clear(int index, int kind, const void *color, uint32_t mask, bool de
         pass_size(&pw, &ph);
         LOG("[clear] pass %d idx %d depth %d (%g) stencil %d | pass %dx%d scissor %d,%d %dx%d\n", debug_pass_no, index, depth,
             dval, stencil, pw, ph, st.scissor[0][0], st.scissor[0][1], st.scissor[0][2], st.scissor[0][3]);
+    }
+    {   // ODYSSEY_LOG_DEPTH=1: every depth clear, with dval and the current depth range [zn, zf]
+        static int log_depth = -1;
+        if (log_depth < 0) log_depth = getenv("ODYSSEY_LOG_DEPTH") != NULL;
+        if (log_depth && depth)
+            LOG("[depth] clear dval=%g | range %g %g\n", dval, st.depth_range[0][0], st.depth_range[0][1]);
     }
     MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
     id<MTLLibrary> lib = clear_lib(index < 0 ? 0 : index);
@@ -1895,6 +1921,26 @@ static void draw(CmdRec *r, bool indexed) {
     }
     float *vp = st.viewport[0];
     float zn = st.depth_range[0][0], zf = st.depth_range[0][1];
+
+    // ODYSSEY_LOG_DEPTH=1: the depth range (zn zf), test function, write flag and NVN depth mode per draw.
+    // Rate-limited: the first 10 draws plus every draw where the range or test changes.
+    {
+        static int log_depth = -1;
+        if (log_depth < 0) log_depth = getenv("ODYSSEY_LOG_DEPTH") != NULL;
+        if (log_depth) {
+            static uint64_t last_fs, last_zn, last_zf, last_test, last_write;
+            static int ndepth;
+            uint64_t fs = st.program ? st.program->stages[1].code_addr : 0;
+            uint64_t izn = (uint64_t)(zn * 4096), izf = (uint64_t)(zf * 4096);
+            if (ndepth < 10 || fs != last_fs || izn != last_zn || izf != last_zf || st.ds[2] != last_test ||
+                (st.ds[1] != 0) != last_write) {
+                LOG("[depth] draw zn=%g zf=%g test=%u write=%u mode=%u fs=%llx\n", zn, zf, st.ds[2], st.ds[1] != 0,
+                    nvn_depth_mode(), (unsigned long long)fs);
+                last_fs = fs; last_zn = izn; last_zf = izf; last_test = st.ds[2]; last_write = st.ds[1] != 0;
+                ndepth++;
+            }
+        }
+    }
 
     // resources
     bind_cbufs(0, pr->vi);
