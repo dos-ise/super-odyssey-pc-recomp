@@ -1,0 +1,79 @@
+# The macOS DMG (Apple Silicon, ad-hoc signed; tools/make_dmg.sh) built from a clean checkout on GitHub's machines,
+# kept as a downloadable artifact of each run (Actions > the run > Artifacts), like the Windows zip and the Linux
+# AppImage in build.yml. Nothing is published: releases stay a manual step (tools/release.sh), which tests these
+# packages first - except a manual dispatch with a version (below) publishes the DMG to that release, like the
+# fork's workflow. No game files or game code are involved: the package holds the app and the setup's tools only,
+# and players build the game code from their own copy.
+#
+# Two jobs, as in the fork's macos-build.yml: a quick compile check of the runtime on every PR (the full DMG is
+# heavy: SDL3 + LGPL FFmpeg + a relocatable Python built from source, the frozen generator, zig, then the bundle),
+# and the DMG itself when asked - add the "build-macos" label to a PR, or dispatch manually.
+name: macos-build
+
+on:
+  pull_request:
+    paths: ['runtime/**', 'Makefile', '.github/workflows/**']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version to publish (e.g. 0.4.7). Empty = build only.'
+        required: false
+        type: string
+
+jobs:
+  compile-check:
+    runs-on: macos-15
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools and libraries
+        run: brew install cmake ninja nasm sdl3 ffmpeg
+      - name: Compile the runtime
+        run: |
+          set -o pipefail
+          mkdir -p build
+          make -j"$(sysctl -n hw.ncpu)" runtime-objs 2>&1 | tee build/check.log
+      - name: Log on failure
+        if: failure()
+        run: |
+          echo "::error title=macos build log (end)::$(tail -n 120 build/check.log | sed 's/%/%25/g' | sed -e ':a' -e 'N' -e '$!ba' -e 's/\n/%0A/g')"
+
+  # The full DMG (make deps: SDL3, LGPL FFmpeg, a relocatable Python; make gen-helper; tools/fetch_zig.sh; make dmg):
+  # heavy, so it only runs when asked - add the "build-macos" label to the PR, or dispatch manually. The compile
+  # check above runs on every PR push. A manual dispatch with a version publishes the DMG to that release (the
+  # linux/windows jobs may have created it first).
+  dmg:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'build-macos')
+    runs-on: macos-15
+    timeout-minutes: 150
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the DMG
+        run: |
+          set -o pipefail
+          mkdir -p build
+          { make deps && make gen-helper && tools/fetch_zig.sh && make -j"$(sysctl -n hw.ncpu)" dmg; } 2>&1 | tee build/ci.log
+      - name: Log on failure
+        if: failure()
+        run: |
+          { sed -n '/Undefined symbols/,/symbol(s) not found/p' build/ci.log; echo '--- tail ---'; tail -n 5 build/ci.log; } | sed 's/%/%25/g' | sed -e ':a' -e 'N' -e '$!ba' -e 's/\n/%0A/g' | sed 's/^/::error title=macos build log (end)::/'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64
+          path: build/dist/*.dmg
+          if-no-files-found: error
+          retention-days: 30
+      - name: Publish to release
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.version != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v${{ github.event.inputs.version }}"
+          # create the release if it does not exist yet (the linux/windows jobs may create it first)
+          gh release create "$TAG" --title "Super Odyssey PC Recomp ${{ github.event.inputs.version }}" \
+            --notes "Release ${{ github.event.inputs.version }}" 2>/dev/null || true
+          gh release upload "$TAG" build/dist/*.dmg --clobber

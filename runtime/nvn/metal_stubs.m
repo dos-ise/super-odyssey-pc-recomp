@@ -4,6 +4,16 @@
 #include <stdint.h>
 #include "texpatch.h"
 
+// The Linux/Vulkan renderer's features (exec.c, device.c, pacing.c) that the Metal backend doesn't have: the shared
+// code (rqueue.c, objects.c, menu.mm) calls them, so each answers "nothing to do" - no guarded compute writes, no
+// early fences, no interp replay, no display frame timing on Metal.
+uint64_t renderer_guest_write_seq(void) { return 0; }
+bool renderer_fence_point(uint64_t *mark) { (void)mark; return false; }
+uint64_t renderer_guard_fence(uint64_t mark, bool protect) { (void)mark, (void)protect; return 0; }
+void renderer_guard_sweep(void) {}
+bool interp_replay_busy(void) { return false; }
+float vk_display_frame_ms(void) { return 0.0f; }  // (the overlay then uses ImGui's own frame time)
+
 int texpatch_identify(const NvnTexture *t) { (void)t; return -1; }
 int texpatch_bottle_kind(int id) { (void)id; return 0; }
 bool texpatch_is_item_cursor(int id) { (void)id; return false; }
@@ -14,7 +24,7 @@ void texpatch_apply(int id, uint32_t lv, uint8_t *blocks, uint32_t w, uint32_t h
 int texpatch_heart_kind(int id) { (void)id; return 0; }
 void texpatch_heart_tint(int kind, float tint[8]) { (void)kind, (void)tint; }
 
-const char *game_level_name(void) { return ""; }
+// (game_level_name is interp.c's now: it compiles on every platform)
 void warp_frame(uint64_t frame) { (void)frame; }
 void save_editor_frame(uint64_t frame) { (void)frame; }
 
