@@ -253,8 +253,10 @@ dlls: $(EXE)
 # Also the vendors' upscaler runtimes (tools/fetch_upscalers.sh: DLSS, FSR 3.1 / 4, XeSS) and the pipeline seed.
 # Order: make deps-windows; make gen-helper; tools/fetch_zig.sh; tools/fetch_upscalers.sh; make dist
 # (all from a clean checkout: .github/workflows/build.yml does exactly this).
-VERSION  := $(shell sed -n 's/^#define APP_VERSION "\(.*\)"/\1/p' runtime/version.h)
-RC_VERSION := $(shell sed -n 's/.*"ProductVersion", "\(.*\)"/\1/p' runtime/platform/windows.rc)
+# (grep | cut, not sed with \(...\) or a # in the pattern: macOS's GNU make 3.81 misreads both - an escaped paren or
+# a hash sign inside $(shell ...) ends the call early and it stops with "unterminated call to function 'shell'")
+VERSION  := $(shell grep 'APP_VERSION' runtime/version.h | cut -d'"' -f2)
+RC_VERSION := $(shell grep 'ProductVersion' runtime/platform/windows.rc | cut -d'"' -f4)
 DIST     := build/dist/Super Odyssey PC Recomp
 WIN_B    := build/win-release
 ifeq ($(PLATFORM),windows)

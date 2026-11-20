@@ -151,6 +151,7 @@ static bool draw_item_cursor;           // a fragment texture is the Items page'
 #define RSCALE_BUFFER_INDEX 18
 
 static int debug_pass_no;
+static int pass_draws;  // draws encoded since the last end_pass (diagnostics)
 static void end_pass(void) {
     if (enc) {
         [enc endEncoding];
@@ -167,6 +168,58 @@ static void end_pass(void) {
             snprintf(path, sizeof path, "build/pass_%03d_a.png", debug_pass_no++);
             renderer_save_texture_alpha(t, path);
         }
+        // ODYSSEY_SHOT_RT=<frame>: save the main scene render target (the first scalable 1600x900 target) once.
+        // Tells whether the 3D scene is black in its own render target or only after the copy into the window image.
+        static long shot_rt = -1;
+        if (shot_rt < 0) shot_rt = getenv("ODYSSEY_SHOT_RT") ? atol(getenv("ODYSSEY_SHOT_RT")) : 0;
+        extern uint64_t renderer_present_count(void);
+        if (shot_rt && renderer_present_count() == (uint64_t)shot_rt && st.rt.ncolor && st.rt.color[0] &&
+            st.rt.color[0]->backend) {
+            NvnTexture *t0 = st.rt.color[0];
+            float sx, sy;
+            renderer_texture_scale(t0, &sx, &sy);
+            if ((sx != 1 || sy != 1) && t0->width == 1600 && t0->height == 900) {
+                id<MTLTexture> t = renderer_texture(t0, nil, true);
+                id<MTLCommandBuffer> c = cmdbuf;
+                cmdbuf = nil;
+                [c commit];
+                [c waitUntilCompleted];
+                renderer_save_texture(t, getenv("ODYSSEY_SHOT_RT_PATH") ? getenv("ODYSSEY_SHOT_RT_PATH") : "build/rt.png");
+                shot_rt = 0;  // once
+            }
+        }
+        // auto-diagnostic: save the scene target (the 1600x900 f0x3f render target) after the first few passes that
+        // actually draw into it (draws > 5; plain clears and tiny passes are skipped) - the scene itself, then the
+        // deferred lighting - to see where it turns black
+        if (st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->backend && st.rt.color[0]->format == 0x3f &&
+            st.rt.color[0]->width == 1600 && st.rt.color[0]->height == 900) {
+            static int nscene;
+            if (pass_draws > 5) {
+                LOG("[diag] scene pass %d: target addr %llx draws %d depth %s\n", nscene, st.rt.color[0]->addr, pass_draws,
+                    st.rt.depth ? "yes" : "no");
+                if (nscene < 4) {
+                    id<MTLTexture> t = renderer_texture(st.rt.color[0], nil, true);
+                    id<MTLCommandBuffer> c = cmdbuf;
+                    cmdbuf = nil;
+                    [c commit];
+                    [c waitUntilCompleted];
+                    char path[64];
+                    snprintf(path, sizeof path, "build/scene_%d_%llx.png", nscene, st.rt.color[0]->addr);
+                    renderer_save_texture(t, path);
+                    if (st.rt.depth && st.rt.depth->backend) {
+                        id<MTLTexture> dt = renderer_texture(st.rt.depth, nil, true);
+                        id<MTLCommandBuffer> dc = cmdbuf;
+                        cmdbuf = nil;
+                        [dc commit];
+                        [dc waitUntilCompleted];
+                        snprintf(path, sizeof path, "build/scene_%d_depth.png", nscene);
+                        renderer_save_texture(dt, path);
+                    }
+                    nscene++;
+                }
+            }
+        }
+        pass_draws = 0;
     }
 }
 
@@ -369,8 +422,10 @@ static id<MTLTexture> view_texture(NvnTexture *t, const NvnTextureView *v, bool 
     NSUInteger lv0 = (v->setmask & 1) ? v->base_level : 0;
     NSUInteger nlv = (v->setmask & 1) && v->num_levels ? v->num_levels : base.mipmapLevelCount - lv0;
     NSUInteger ly0 = (v->setmask & 2) ? v->min_layer : 0;
+    if (base.textureType != MTLTextureTypeCube && base.textureType != MTLTextureTypeCubeArray && ly0 >= base.arrayLength)
+        ly0 = base.arrayLength - 1;  // (the game may ask for a layer the texture has not)
     NSUInteger nly = (v->setmask & 2) && v->num_layers ? v->num_layers : base.arrayLength - ly0;
-    if (base.textureType == MTLTextureTypeCube) nly = 6;
+    if (base.textureType == MTLTextureTypeCube || base.textureType == MTLTextureTypeCubeArray) nly = 6;
     MTLTextureType type = base.textureType;
     if (render && (type == MTLTextureType2DArray || type == MTLTextureTypeCube) && nly == 1) type = MTLTextureType2D;
     if (lv0 + nlv > base.mipmapLevelCount) nlv = base.mipmapLevelCount - lv0;
@@ -382,6 +437,12 @@ static id<MTLTexture> view_texture(NvnTexture *t, const NvnTextureView *v, bool 
         LOG("[view] tex fmt %#x (mtl %lu) viewed as nvn %#x (mtl %lu)\n", t->format, (unsigned long)base.pixelFormat, v->format, (unsigned long)pf);
     }
     NSUInteger ns = type == MTLTextureType2D ? 1 : nly;
+    // The game may ask for a layer a texture has not (a clear in the intro); Metal asserts on an out-of-range slice
+    // range. A cube's slices are its faces (6 per cube): its range is arrayLength * 6 and must stay whole cubes.
+    NSUInteger max_slices = (type == MTLTextureTypeCube || type == MTLTextureTypeCubeArray) ? base.arrayLength * 6 : base.arrayLength;
+    if (ly0 >= max_slices) ly0 = max_slices - 1;
+    if (ly0 + ns > max_slices) ns = max_slices - ly0;
+    if ((type == MTLTextureTypeCube || type == MTLTextureTypeCubeArray) && (ly0 % 6 || ns % 6)) { ly0 = 0; ns = max_slices >= 6 ? 6 : max_slices; }
     uint64_t params = (uint64_t)pf | (uint64_t)type << 16 | (uint64_t)lv0 << 24 | (uint64_t)nlv << 32 | (uint64_t)ly0 << 40 | (uint64_t)ns << 52;
     id<MTLTexture> got = view_cached(base, params, ^{
         return [base newTextureViewWithPixelFormat:pf textureType:type levels:NSMakeRange(lv0, nlv) slices:NSMakeRange(ly0, ns)];
@@ -513,6 +574,8 @@ static id<MTLLibrary> clear_lib(int index) {
     return libs[index];
 }
 
+static int rt_kind(uint32_t f);  // (defined below; the clear shader is picked by the attachment format)
+
 static void attachment_formats(MTLRenderPipelineDescriptor *pd) {
     for (int i = 0; i < st.rt.ncolor; i++)
         if (st.rt.color[i]) pd.colorAttachments[i].pixelFormat = view_texture(st.rt.color[i], &st.rt.cview[i], st.rt.has_cview[i], true, nil).pixelFormat;
@@ -534,10 +597,19 @@ static void clear(int index, int kind, const void *color, uint32_t mask, bool de
         LOG("[clear] pass %d idx %d depth %d (%g) stencil %d | pass %dx%d scissor %d,%d %dx%d\n", debug_pass_no, index, depth,
             dval, stencil, pw, ph, st.scissor[0][0], st.scissor[0][1], st.scissor[0][2], st.scissor[0][3]);
     }
+    {   // ODYSSEY_LOG_DEPTH=1: every depth clear, with dval and the current depth range [zn, zf]
+        static int log_depth = -1;
+        if (log_depth < 0) log_depth = getenv("ODYSSEY_LOG_DEPTH") != NULL;
+        if (log_depth && depth)
+            LOG("[depth] clear dval=%g | range %g %g\n", dval, st.depth_range[0][0], st.depth_range[0][1]);
+    }
     MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
     id<MTLLibrary> lib = clear_lib(index < 0 ? 0 : index);
     pd.vertexFunction = [lib newFunctionWithName:@"vs"];
     static NSString *const fs[] = {@"fs_f", @"fs_i", @"fs_u"};
+    if (index >= 0 && index < st.rt.ncolor && st.rt.color[index])
+        kind = rt_kind(st.rt.color[index]->format);  // pick the shader by the attachment format: the guest's kind can
+                                                     // be int/uint for a float target (int4 -> RG11B10Float fails)
     if (kind < 0 || kind > 2) kind = 0;  // (as Vulkan: anything else is float - the guest passes garbage in the upper bits)
     pd.fragmentFunction = [lib newFunctionWithName:index >= 0 ? fs[kind] : @"fs_none"];
     attachment_formats(pd);
@@ -1070,6 +1142,14 @@ static id<MTLTexture> sampled_texture(NvnTexture *t, const NvnTextureView *v, bo
             tex = view_cached(src, 0x6000000000000000ull | 2, ^{ return [src newTextureViewWithPixelFormat:src.pixelFormat textureType:MTLTextureType2DArray levels:NSMakeRange(0, src.mipmapLevelCount) slices:NSMakeRange(0, 1)]; });
         else if (want == MTLTextureTypeCube && tex.textureType == MTLTextureType2DArray && tex.arrayLength >= 6)
             tex = view_cached(src, 0x6000000000000000ull | 3, ^{ return [src newTextureViewWithPixelFormat:src.pixelFormat textureType:MTLTextureTypeCube levels:NSMakeRange(0, src.mipmapLevelCount) slices:NSMakeRange(0, 6)]; });
+        else if (want == MTLTextureType2D && tex.textureType == MTLTextureType3D) {
+            // a 3D texture sampled as 2D (the scene's LUTs): the shader gives two coordinates, so the first depth
+            // slice is what the hardware would use
+            static int n3d;
+            if (n3d++ < 20) LOG("[tex] 3D->2D view %ux%ux%u fmt %#x addr %llx\n", t->width, t->height, t->depth, t->format, t->addr);
+            tex = view_cached(src, 0x6000000000000000ull | 4, ^{ return [src newTextureViewWithPixelFormat:src.pixelFormat textureType:MTLTextureType2D levels:NSMakeRange(0, src.mipmapLevelCount) slices:NSMakeRange(0, 1)]; });
+            if (n3d == 1 && tex.textureType == MTLTextureType2D) renderer_save_texture(tex, "build/lut3d_slice0.png");
+        }
         else {
             static int nlog;
             if (nlog++ < 30) LOG("[tex] type mismatch: want %lu have %lu (%ux%ux%u target %u fmt %#x arr %lu)\n", (unsigned long)want,
@@ -1077,6 +1157,8 @@ static id<MTLTexture> sampled_texture(NvnTexture *t, const NvnTextureView *v, bo
             return dummy_texture(want_type);
         }
     }
+    if (tex.textureType != want && tex.textureType != MTLTextureType2DMultisample)  // a view that failed to build
+        return dummy_texture(want_type);
     return tex;
 }
 
@@ -1267,6 +1349,19 @@ static void bind_textures(int stage, ShaderInfo *si) {
             renderer_save_texture(tex, path);
             snprintf(path, sizeof path, "build/dtex_%03d_%d_a.png", dn - 1, i);
             renderer_save_texture_alpha(tex, path);
+        }
+        // scene-texture diagnostic: save the fragment textures of the first few draws into the main scene target
+        // (1600x900 f0x3f, many draws) - if the scene's colour is black but its depth is written, the fragment
+        // shader is sampling black textures
+        if (stage == 1 && st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->format == 0x3f &&
+            st.rt.color[0]->width == 1600 && st.rt.color[0]->height == 900 && pass_draws > 100 && pass_draws <= 112 &&
+            tex.textureType == MTLTextureType2D) {
+            static int sn;
+            if (sn < 12) {
+                char path[128];
+                snprintf(path, sizeof path, "build/scenetex_%02d_%d.png", sn++, i);
+                renderer_save_texture(tex, path);
+            }
         }
         if (stage == 0) { [enc setVertexTexture:tex atIndex:i]; [enc setVertexSamplerState:smp atIndex:i]; }
         else { [enc setFragmentTexture:tex atIndex:i]; [enc setFragmentSamplerState:smp atIndex:i]; }
@@ -1864,6 +1959,42 @@ static void draw(CmdRec *r, bool indexed) {
     [enc setStencilFrontReferenceValue:st.stencil_ref[0] backReferenceValue:st.stencil_ref[1]];
     [enc setBlendColorRed:st.blend_color[0] green:st.blend_color[1] blue:st.blend_color[2] alpha:st.blend_color[3]];
 
+    // scene-shader diagnostic: dump the shaders of the main scene pass (the one with hundreds of draws,
+    // e.g. 541 draws into 726379f800) - the earlier small passes are G-buffer / deferred lighting
+    if (st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->format == 0x3f && st.rt.color[0]->width == 1600 &&
+        st.rt.color[0]->height == 900 && pass_draws > 100 && pass_draws <= 104) {
+        static int sd;
+        if (sd < 2 && pr->fi->msl) {
+            char path[128];
+            snprintf(path, sizeof path, "build/scenefs_%d_%llx.metal", sd++, st.program->stages[1].code_addr);
+            FILE *f = fopen(path, "w");
+            if (f) { fputs(pr->fi->msl, f); fclose(f); }
+        }
+        static int sv;
+        if (sv < 2 && pr->vi->msl) {
+            char path[128];
+            snprintf(path, sizeof path, "build/scenev_%d_%llx.metal", sv++, st.program->stages[0].code_addr);
+            FILE *f = fopen(path, "w");
+            if (f) { fputs(pr->vi->msl, f); fclose(f); }
+        }
+        // scene-lighting diagnostic: dump the fragment AND vertex UBOs of the main scene pass - the scene's
+        // colour is black while its depth is written and its G-buffer textures have content, so the lighting
+        // constants may be zero, or the vertex constants (projection) may be wrong and degenerate the triangles
+        static int nd;
+        if (nd < 1) {
+            nd++;
+            for (int s = 0; s < 2; s++) {
+                for (int i = 0; i < 18; i++) {
+                    if (!st.ubuf[s][i].addr) continue;
+                    const float *f = (const float *)(uintptr_t)st.ubuf[s][i].addr;
+                    LOG("[sceneubo] %c%d (%llu):", s ? 'f' : 'v', i, st.ubuf[s][i].size);
+                    for (uint64_t k = 0; k < st.ubuf[s][i].size / 4 && k < 1200; k++) LOG(" %g", f[k]);
+                    LOG("\n");
+                }
+            }
+        }
+    }
+
     // rasterizer
     uint8_t cull = st.poly[0];
     if (vkey.flip_x) cull = 0;  // (mirror mode's composite: one full-screen quad, either winding)
@@ -1887,6 +2018,26 @@ static void draw(CmdRec *r, bool indexed) {
     }
     float *vp = st.viewport[0];
     float zn = st.depth_range[0][0], zf = st.depth_range[0][1];
+
+    // ODYSSEY_LOG_DEPTH=1: the depth range (zn zf), test function, write flag and NVN depth mode per draw.
+    // Rate-limited: the first 10 draws plus every draw where the range or test changes.
+    {
+        static int log_depth = -1;
+        if (log_depth < 0) log_depth = getenv("ODYSSEY_LOG_DEPTH") != NULL;
+        if (log_depth) {
+            static uint64_t last_fs, last_zn, last_zf, last_test, last_write;
+            static int ndepth;
+            uint64_t fs = st.program ? st.program->stages[1].code_addr : 0;
+            uint64_t izn = (uint64_t)(zn * 4096), izf = (uint64_t)(zf * 4096);
+            if (ndepth < 10 || fs != last_fs || izn != last_zn || izf != last_zf || st.ds[2] != last_test ||
+                (st.ds[1] != 0) != last_write) {
+                LOG("[depth] draw zn=%g zf=%g test=%u write=%u mode=%u fs=%llx\n", zn, zf, st.ds[2], st.ds[1] != 0,
+                    nvn_depth_mode(), (unsigned long long)fs);
+                last_fs = fs; last_zn = izn; last_zf = izf; last_test = st.ds[2]; last_write = st.ds[1] != 0;
+                ndepth++;
+            }
+        }
+    }
 
     // resources
     bind_cbufs(0, pr->vi);
@@ -2118,6 +2269,7 @@ static void draw(CmdRec *r, bool indexed) {
     }
     }  // runs
     stat_draws++;
+    pass_draws++;
     if (dbg_this) {
         static int nlog;
         if (nlog++ < 4) {
