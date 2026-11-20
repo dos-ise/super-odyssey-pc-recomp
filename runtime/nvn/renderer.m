@@ -1959,6 +1959,18 @@ static void draw(CmdRec *r, bool indexed) {
     [enc setStencilFrontReferenceValue:st.stencil_ref[0] backReferenceValue:st.stencil_ref[1]];
     [enc setBlendColorRed:st.blend_color[0] green:st.blend_color[1] blue:st.blend_color[2] alpha:st.blend_color[3]];
 
+    // scene-shader diagnostic: dump the fragment shader of the first draws into the main scene target
+    if (st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->format == 0x3f && st.rt.color[0]->width == 1600 &&
+        st.rt.color[0]->height == 900 && pass_draws > 5 && pass_draws <= 8 && pr->fi->msl) {
+        static int sd;
+        if (sd < 2) {
+            char path[128];
+            snprintf(path, sizeof path, "build/scenefs_%d_%llx.metal", sd++, st.program->stages[1].code_addr);
+            FILE *f = fopen(path, "w");
+            if (f) { fputs(pr->fi->msl, f); fclose(f); }
+        }
+    }
+
     // rasterizer
     uint8_t cull = st.poly[0];
     if (vkey.flip_x) cull = 0;  // (mirror mode's composite: one full-screen quad, either winding)
