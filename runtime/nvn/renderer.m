@@ -1354,7 +1354,7 @@ static void bind_textures(int stage, ShaderInfo *si) {
         // (1600x900 f0x3f, many draws) - if the scene's colour is black but its depth is written, the fragment
         // shader is sampling black textures
         if (stage == 1 && st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->format == 0x3f &&
-            st.rt.color[0]->width == 1600 && st.rt.color[0]->height == 900 && pass_draws > 5 && pass_draws <= 12 &&
+            st.rt.color[0]->width == 1600 && st.rt.color[0]->height == 900 && pass_draws > 100 && pass_draws <= 112 &&
             tex.textureType == MTLTextureType2D) {
             static int sn;
             if (sn < 12) {
@@ -1959,9 +1959,10 @@ static void draw(CmdRec *r, bool indexed) {
     [enc setStencilFrontReferenceValue:st.stencil_ref[0] backReferenceValue:st.stencil_ref[1]];
     [enc setBlendColorRed:st.blend_color[0] green:st.blend_color[1] blue:st.blend_color[2] alpha:st.blend_color[3]];
 
-    // scene-shader diagnostic: dump the fragment shader of the first draws into the main scene target
+    // scene-shader diagnostic: dump the fragment shader of the main scene pass (the one with hundreds of draws,
+    // e.g. 541 draws into 726379f800) - the earlier small passes are G-buffer / deferred lighting
     if (st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->format == 0x3f && st.rt.color[0]->width == 1600 &&
-        st.rt.color[0]->height == 900 && pass_draws > 5 && pass_draws <= 8 && pr->fi->msl) {
+        st.rt.color[0]->height == 900 && pass_draws > 100 && pass_draws <= 104 && pr->fi->msl) {
         static int sd;
         if (sd < 2) {
             char path[128];
