@@ -1959,28 +1959,38 @@ static void draw(CmdRec *r, bool indexed) {
     [enc setStencilFrontReferenceValue:st.stencil_ref[0] backReferenceValue:st.stencil_ref[1]];
     [enc setBlendColorRed:st.blend_color[0] green:st.blend_color[1] blue:st.blend_color[2] alpha:st.blend_color[3]];
 
-    // scene-shader diagnostic: dump the fragment shader of the main scene pass (the one with hundreds of draws,
+    // scene-shader diagnostic: dump the shaders of the main scene pass (the one with hundreds of draws,
     // e.g. 541 draws into 726379f800) - the earlier small passes are G-buffer / deferred lighting
     if (st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->format == 0x3f && st.rt.color[0]->width == 1600 &&
-        st.rt.color[0]->height == 900 && pass_draws > 100 && pass_draws <= 104 && pr->fi->msl) {
+        st.rt.color[0]->height == 900 && pass_draws > 100 && pass_draws <= 104) {
         static int sd;
-        if (sd < 2) {
+        if (sd < 2 && pr->fi->msl) {
             char path[128];
             snprintf(path, sizeof path, "build/scenefs_%d_%llx.metal", sd++, st.program->stages[1].code_addr);
             FILE *f = fopen(path, "w");
             if (f) { fputs(pr->fi->msl, f); fclose(f); }
         }
-        // scene-lighting diagnostic: dump the fragment UBOs of the main scene pass - the scene's colour is black
-        // while its depth is written and its G-buffer textures have content, so the lighting constants may be zero
+        static int sv;
+        if (sv < 2 && pr->vi->msl) {
+            char path[128];
+            snprintf(path, sizeof path, "build/scenev_%d_%llx.metal", sv++, st.program->stages[0].code_addr);
+            FILE *f = fopen(path, "w");
+            if (f) { fputs(pr->vi->msl, f); fclose(f); }
+        }
+        // scene-lighting diagnostic: dump the fragment AND vertex UBOs of the main scene pass - the scene's
+        // colour is black while its depth is written and its G-buffer textures have content, so the lighting
+        // constants may be zero, or the vertex constants (projection) may be wrong and degenerate the triangles
         static int nd;
         if (nd < 1) {
             nd++;
-            for (int i = 0; i < 18; i++) {
-                if (!st.ubuf[1][i].addr) continue;
-                const float *f = (const float *)(uintptr_t)st.ubuf[1][i].addr;
-                LOG("[sceneubo] f%d (%llu):", i, st.ubuf[1][i].size);
-                for (uint64_t k = 0; k < st.ubuf[1][i].size / 4 && k < 1200; k++) LOG(" %g", f[k]);
-                LOG("\n");
+            for (int s = 0; s < 2; s++) {
+                for (int i = 0; i < 18; i++) {
+                    if (!st.ubuf[s][i].addr) continue;
+                    const float *f = (const float *)(uintptr_t)st.ubuf[s][i].addr;
+                    LOG("[sceneubo] %c%d (%llu):", s ? 'f' : 'v', i, st.ubuf[s][i].size);
+                    for (uint64_t k = 0; k < st.ubuf[s][i].size / 4 && k < 1200; k++) LOG(" %g", f[k]);
+                    LOG("\n");
+                }
             }
         }
     }
