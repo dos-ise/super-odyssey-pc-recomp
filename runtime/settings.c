@@ -83,7 +83,12 @@ Settings g_settings = {
     .shader_preload = false,  // (it costs a lot of memory: nvn/vulkan/exec.c preload_room)
     .early_fences = 1,   // (on: nvn/objects.c nvnSyncWait; owner 2026-11-16: the speed-ups on by default, every platform)
     .record_thread = -1,  // (Auto: on with an NVIDIA GPU, the only kind it has been tested on - nvn/vulkan/exec.c dq_enabled)
-    .stick_deadzone = 10,  // (the Switch's controllers apply their own; 0 let a worn stick drift the map pointer, #22)
+    // (the Switch's controllers apply their own; 0 let a worn stick drift the map pointer, #22, #37, #106. 5% as Switch
+    // emulators; it was 10%, then the owner asked for 5 with finer control, 2026-11-19)
+    .stick_deadzone_l = 5, .stick_deadzone_r = 5,
+    .stick_range_l = 100, .stick_range_r = 100,
+    .motion_gyro_sens = 100,
+    .motion_shake_threshold = 0,
     .skip_intro = true,
     .warmup = WARMUP_AUTO,  // (Long - every recorded pipeline ready before play - where the PC has the memory for it)
     .check_updates = true,
@@ -306,7 +311,18 @@ void settings_load(void) {
         }
         else if (!strcmp(key, "motion_shake_pad")) { int v = atoi(val); g_settings.motion_shake_pad = v >= -1 && v < 64 ? v : -1; }
         else if (!strcmp(key, "motion_shake_key")) { int v = atoi(val); g_settings.motion_shake_key = v >= 0 && v < 1024 ? v : 0; }
-        else if (!strcmp(key, "stick_deadzone")) g_settings.stick_deadzone = atoi(val) < 0 ? 0 : atoi(val) > 40 ? 40 : atoi(val);
+        else if (!strcmp(key, "stick_deadzone")) {  // (before 0.4.11: one for both sticks. 0 and 10 were the defaults
+            // written by older versions - 0 is what let the map pointer drift (#106) - so they become the new default)
+            int v = atoi(val) < 0 ? 0 : atoi(val) > 50 ? 50 : atoi(val);
+            if (v == 0 || v == 10) v = 5;
+            g_settings.stick_deadzone_l = g_settings.stick_deadzone_r = v;
+        }
+        else if (!strcmp(key, "stick_deadzone_left")) g_settings.stick_deadzone_l = atoi(val) < 0 ? 0 : atoi(val) > 50 ? 50 : atoi(val);
+        else if (!strcmp(key, "stick_deadzone_right")) g_settings.stick_deadzone_r = atoi(val) < 0 ? 0 : atoi(val) > 50 ? 50 : atoi(val);
+        else if (!strcmp(key, "stick_range_left")) g_settings.stick_range_l = atoi(val) < 50 ? 50 : atoi(val) > 150 ? 150 : atoi(val);
+        else if (!strcmp(key, "stick_range_right")) g_settings.stick_range_r = atoi(val) < 50 ? 50 : atoi(val) > 150 ? 150 : atoi(val);
+        else if (!strcmp(key, "motion_gyro_sensitivity")) g_settings.motion_gyro_sens = atoi(val) < 25 ? 25 : atoi(val) > 400 ? 400 : atoi(val);
+        else if (!strcmp(key, "motion_shake_threshold")) g_settings.motion_shake_threshold = atoi(val) < 0 ? 0 : atoi(val) > 20 ? 20 : atoi(val);
         else if (!strcmp(key, "resolution")) {
             int n = atoi(val);
             g_settings.res_mode = !strcmp(val, "dynamic") ? RES_DYNAMIC : !strcmp(val, "75%") ? RES_Q75 :
@@ -371,6 +387,8 @@ void settings_load(void) {
         else if (!strcmp(key, "shader_preload")) g_settings.shader_preload = atoi(val) != 0;
         else if (!strcmp(key, "shader_known_only")) g_settings.shader_known_only = atoi(val) != 0;
         else if (!strcmp(key, "shadow_quality")) g_settings.shadow_quality = atoi(val) < 0 ? 0 : atoi(val) > 2 ? 2 : atoi(val);
+        else if (!strcmp(key, "bloom_quality")) g_settings.bloom_quality = !strcmp(val, "high") || atoi(val) > 0;
+        else if (!strcmp(key, "draw_distance")) g_settings.draw_distance = atoi(val) < 0 ? 0 : atoi(val) > 2 ? 2 : atoi(val);
         // (on / off; "auto" and the older 0 / 1 were the earlier defaults - now on, as the default is)
         else if (!strcmp(key, "early_fences")) g_settings.early_fences = strcmp(val, "off") != 0;
         else if (!strcmp(key, "record_thread")) g_settings.record_thread = !strcmp(val, "on") ? 1 : !strcmp(val, "off") ? 0 : -1;
@@ -470,7 +488,12 @@ void settings_save(void) {
             g_settings.motion_gyro_bias[2]);
     fprintf(f, "motion_shake_pad = %d\n", g_settings.motion_shake_pad);
     fprintf(f, "motion_shake_key = %d\n", g_settings.motion_shake_key);
-    fprintf(f, "stick_deadzone = %d\n", g_settings.stick_deadzone);
+    fprintf(f, "stick_deadzone_left = %d\n", g_settings.stick_deadzone_l);
+    fprintf(f, "stick_deadzone_right = %d\n", g_settings.stick_deadzone_r);
+    fprintf(f, "stick_range_left = %d\n", g_settings.stick_range_l);
+    fprintf(f, "stick_range_right = %d\n", g_settings.stick_range_r);
+    fprintf(f, "motion_gyro_sensitivity = %d\n", g_settings.motion_gyro_sens);
+    fprintf(f, "motion_shake_threshold = %d\n", g_settings.motion_shake_threshold);
     fprintf(f, "upscaler = %s\n", g_settings.upscaler == UPSCALE_METALFX ? "metalfx" : g_settings.upscaler == UPSCALE_FSR1 ? "fsr1" : "bilinear");
     fprintf(f, "antialias = %s\n", g_settings.antialias == AA_SMAA ? "smaa" : g_settings.antialias == AA_FXAA ? "fxaa" : "off");
     fprintf(f, "dlss_mode = %s\n", dlss_modes[g_settings.dlss_mode]);
@@ -504,6 +527,8 @@ void settings_save(void) {
     fprintf(f, "shader_preload = %d\n", g_settings.shader_preload);
     fprintf(f, "shader_known_only = %d\n", g_settings.shader_known_only);
     fprintf(f, "shadow_quality = %d\n", g_settings.shadow_quality);
+    fprintf(f, "bloom_quality = %s\n", g_settings.bloom_quality ? "high" : "switch");
+    fprintf(f, "draw_distance = %d\n", g_settings.draw_distance);
     fprintf(f, "texture_detail = %d\n", g_settings.texture_detail);
     fprintf(f, "early_fences = %s\n", g_settings.early_fences ? "on" : "off");
     fprintf(f, "record_thread = %s\n", g_settings.record_thread > 0 ? "on" : g_settings.record_thread == 0 ? "off" : "auto");

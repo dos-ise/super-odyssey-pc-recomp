@@ -181,7 +181,9 @@ static bool tex_scalable(const NvnTexture *t) {
     if (t->flags & 0x4) return false;  // NVN_TEXTURE_FLAGS_IMAGE: compute uses the guest's integer texel coordinates.
     // Odyssey's quarter-resolution R11G11B10F bloom chain uses taps spaced for the guest texel grid.
     // Enlarging these targets separates the taps around small highlights and produces visible grids.
-    if (t->format == 0x3f && t->width <= 400 && t->height <= 228) return false;
+    static int bloom_full = -1;  // (experiment) ODYSSEY_BLOOM_SCALE=1: the bloom chain at the internal resolution too
+    if (bloom_full < 0) bloom_full = getenv("ODYSSEY_BLOOM_SCALE") && atoi(getenv("ODYSSEY_BLOOM_SCALE"));
+    if (!bloom_full && t->format == 0x3f && t->width <= 400 && t->height <= 228) return false;
     return output_scale_texture(t);
 }
 

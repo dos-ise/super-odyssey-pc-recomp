@@ -293,12 +293,19 @@ NVN(nvnMemoryPoolBuilderGetFlags) { RET(G(uint32_t, A(0), 8)); }
 NVN(nvnMemoryPoolBuilderGetMemory) { RET(G(uint64_t, A(0), 0x10)); }
 NVN(nvnMemoryPoolBuilderGetSize) { RET(G(uint64_t, A(0), 0x18)); }
 
+uint64_t g_nvn_pool_heap_end;        // (below)
+_Atomic uint64_t g_nvn_pool_bytes;  // (below: bytes of all live pools with storage)
 NVN(nvnMemoryPoolInitialize) {
     NvnPool *p = calloc(1, sizeof *p);
     p->storage = G(uint64_t, A(1), 0x10);
     p->size = G(uint64_t, A(1), 0x18);
     p->flags = G(uint32_t, A(1), 8);
     SET_HOST(A(0), p);
+    // (the stats line, ODYSSEY_LOG_MEM: where the pools in the guest heap end and how much they hold - the GPU reaches only
+    // pools, but the heap's import covers all of it. 2026-11-19: 0.9-1.6 GB of pools reaching 3115 of a 3120 MB heap.)
+    if (p->storage >= HEAP_BASE && p->storage + p->size > g_nvn_pool_heap_end && !(p->flags & 0x200))
+        g_nvn_pool_heap_end = p->storage + p->size;
+    if (p->storage && !(p->flags & 0x200)) atomic_fetch_add(&g_nvn_pool_bytes, p->size);
     if (!p->storage || (p->flags & 0x200)) {  // (NVN_MEMORY_POOL_FLAGS_VIRTUAL: no storage of its own)
         static int n;
         if (n++ < 20) LOG("[nvn] memory pool %llx: storage %llx size %#llx flags %#x\n", (unsigned long long)A(0),
@@ -307,7 +314,10 @@ NVN(nvnMemoryPoolInitialize) {
     RET(1);
 }
 // (frame interpolation: a replay on its own thread must not run while a host object it may use goes - interp.c)
-NVN(nvnMemoryPoolFinalize) { rq_drain(); interp_free_begin(); free(HOST(NvnPool, A(0))); SET_HOST(A(0), 0); interp_free_end(); }
+NVN(nvnMemoryPoolFinalize) {
+    NvnPool *p = HOST(NvnPool, A(0));
+    if (p && p->storage && !(p->flags & 0x200)) atomic_fetch_sub(&g_nvn_pool_bytes, p->size);
+    rq_drain(); interp_free_begin(); free(HOST(NvnPool, A(0))); SET_HOST(A(0), 0); interp_free_end(); }
 NVN(nvnMemoryPoolSetDebugLabel) { (void)c; }
 // al::getF32FromLinearTextureF16, immediately after its indirect MemoryPoolMap
 // call. Both builds keep nc/comp/y/x/offset/row-elements in x19..x24.

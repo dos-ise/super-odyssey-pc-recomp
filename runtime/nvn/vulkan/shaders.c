@@ -953,3 +953,37 @@ VkShaderModule vk_builtin_shader(const char *name) {
     if (n < 64) { snprintf(cache[n].name, sizeof cache[n].name, "%s", name); cache[n++].m = m; }
     return m;
 }
+
+// The release's pipeline seed ships zstd-compressed (pipeline-seed.bin.zst: 5.9 MB of recipes, 70 KB packed - the
+// repository refuses files over 5 MB). Unpacked into cache/graphics-pipelines.bin before a full preparation (device.c prep_seed),
+// and by `SuperOdysseyRecomp --unpack-seed <out>` for tools/release.sh's seed check.
+bool vk_seed_unpack(const char *src, const char *dst) {
+    FILE *f = fopen(src, "rb");
+    if (!f) return false;
+    fseeko(f, 0, SEEK_END);
+    long long n = ftello(f);
+    fseeko(f, 0, SEEK_SET);
+    void *z = n > 0 && n < (64ll << 20) ? malloc((size_t)n) : NULL;
+    bool ok = z && fread(z, 1, (size_t)n, f) == (size_t)n;
+    fclose(f);
+    unsigned long long size = ok ? ZSTD_getFrameContentSize(z, (size_t)n) : 0;
+    ok = ok && size != ZSTD_CONTENTSIZE_UNKNOWN && size != ZSTD_CONTENTSIZE_ERROR && size < (256ull << 20);
+    void *d = ok ? malloc((size_t)size) : NULL;
+    if (d) {
+        size_t got = ZSTD_decompress(d, (size_t)size, z, (size_t)n);
+        ok = !ZSTD_isError(got) && got == size;
+    } else ok = false;
+    free(z);
+    if (ok) {
+        char tmp[1100];
+        snprintf(tmp, sizeof tmp, "%s.tmp", dst);
+        FILE *o = fopen(tmp, "wb");
+        ok = o && fwrite(d, 1, (size_t)size, o) == (size_t)size;
+        if (o) ok = fclose(o) == 0 && ok;
+        if (ok) remove(dst);  // (Windows: rename doesn't replace)
+        ok = ok && rename(tmp, dst) == 0;
+        if (!ok) remove(tmp);
+    }
+    free(d);
+    return ok;
+}

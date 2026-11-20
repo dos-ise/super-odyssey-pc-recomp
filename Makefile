@@ -322,7 +322,7 @@ dist:
 	cp -R build/zig-slim "$(DIST)/zig"
 	cp runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/gamelib.h tools/gamelib_entry.c runtime/hle/hle_symbols.txt \
 	    "$(DIST)/gamelib-src/"
-	cp runtime/nvn/vulkan/known_programs.txt third_party/imgui/misc/fonts/Roboto-Medium.ttf data/pipeline-seed.bin 	    README.md LICENSE "$(DIST)/"
+	cp runtime/nvn/vulkan/known_programs.txt third_party/imgui/misc/fonts/Roboto-Medium.ttf data/pipeline-seed.bin.zst 	    README.md LICENSE "$(DIST)/"
 	mkdir -p "$(DIST)/lang" && cp runtime/ui/lang/*.txt "$(DIST)/lang/"  # (the menu's translations: runtime/ui/i18n.mm)
 	mkdir -p "$(DIST)/fsr2" && cp third_party/fsr2/shaders/* third_party/fsr2/LICENSE.txt "$(DIST)/fsr2/"  # (FSR 2: runtime/nvn/vulkan/fsr2.c)
 	cp build/upscalers/*.dll "$(DIST)/"  # (loaded only when chosen in the menu)
