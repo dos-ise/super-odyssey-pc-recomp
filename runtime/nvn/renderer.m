@@ -1970,6 +1970,19 @@ static void draw(CmdRec *r, bool indexed) {
             FILE *f = fopen(path, "w");
             if (f) { fputs(pr->fi->msl, f); fclose(f); }
         }
+        // scene-lighting diagnostic: dump the fragment UBOs of the main scene pass - the scene's colour is black
+        // while its depth is written and its G-buffer textures have content, so the lighting constants may be zero
+        static int nd;
+        if (nd < 1) {
+            nd++;
+            for (int i = 0; i < 18; i++) {
+                if (!st.ubuf[1][i].addr) continue;
+                const float *f = (const float *)(uintptr_t)st.ubuf[1][i].addr;
+                LOG("[sceneubo] f%d (%llu):", i, st.ubuf[1][i].size);
+                for (uint64_t k = 0; k < st.ubuf[1][i].size / 4 && k < 1200; k++) LOG(" %g", f[k]);
+                LOG("\n");
+            }
+        }
     }
 
     // rasterizer
