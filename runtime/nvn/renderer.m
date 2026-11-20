@@ -151,6 +151,7 @@ static bool draw_item_cursor;           // a fragment texture is the Items page'
 #define RSCALE_BUFFER_INDEX 18
 
 static int debug_pass_no;
+static int pass_draws;  // draws encoded since the last end_pass (diagnostics)
 static void end_pass(void) {
     if (enc) {
         [enc endEncoding];
@@ -192,6 +193,8 @@ static void end_pass(void) {
         if (st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->backend && st.rt.color[0]->format == 0x3f &&
             st.rt.color[0]->width == 1600 && st.rt.color[0]->height == 900) {
             static int nscene;
+            LOG("[diag] scene pass %d: target addr %llx draws %d depth %s\n", nscene, st.rt.color[0]->addr, pass_draws,
+                st.rt.depth ? "yes" : "no");
             if (nscene < 4) {
                 id<MTLTexture> t = renderer_texture(st.rt.color[0], nil, true);
                 id<MTLCommandBuffer> c = cmdbuf;
@@ -199,10 +202,21 @@ static void end_pass(void) {
                 [c commit];
                 [c waitUntilCompleted];
                 char path[64];
-                snprintf(path, sizeof path, "build/scene_%d.png", nscene++);
+                snprintf(path, sizeof path, "build/scene_%d_%llx.png", nscene, st.rt.color[0]->addr);
                 renderer_save_texture(t, path);
+                if (st.rt.depth && st.rt.depth->backend) {
+                    id<MTLTexture> dt = renderer_texture(st.rt.depth, nil, true);
+                    id<MTLCommandBuffer> dc = cmdbuf;
+                    cmdbuf = nil;
+                    [dc commit];
+                    [dc waitUntilCompleted];
+                    snprintf(path, sizeof path, "build/scene_%d_depth.png", nscene);
+                    renderer_save_texture(dt, path);
+                }
+                nscene++;
             }
         }
+        pass_draws = 0;
     }
 }
 
@@ -2203,6 +2217,7 @@ static void draw(CmdRec *r, bool indexed) {
     }
     }  // runs
     stat_draws++;
+    pass_draws++;
     if (dbg_this) {
         static int nlog;
         if (nlog++ < 4) {
