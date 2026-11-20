@@ -189,12 +189,12 @@ static void end_pass(void) {
             }
         }
         // auto-diagnostic: save the scene target (the 1600x900 f0x3f render target) after the first few passes that
-        // actually draw into it (draws > 0; plain clears are skipped) - the scene itself, then the deferred
-        // lighting - to see where it turns black
+        // actually draw into it (draws > 5; plain clears and tiny passes are skipped) - the scene itself, then the
+        // deferred lighting - to see where it turns black
         if (st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->backend && st.rt.color[0]->format == 0x3f &&
             st.rt.color[0]->width == 1600 && st.rt.color[0]->height == 900) {
             static int nscene;
-            if (pass_draws > 0) {
+            if (pass_draws > 5) {
                 LOG("[diag] scene pass %d: target addr %llx draws %d depth %s\n", nscene, st.rt.color[0]->addr, pass_draws,
                     st.rt.depth ? "yes" : "no");
                 if (nscene < 4) {
