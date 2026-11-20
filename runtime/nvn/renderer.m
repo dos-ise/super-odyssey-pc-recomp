@@ -1350,6 +1350,19 @@ static void bind_textures(int stage, ShaderInfo *si) {
             snprintf(path, sizeof path, "build/dtex_%03d_%d_a.png", dn - 1, i);
             renderer_save_texture_alpha(tex, path);
         }
+        // scene-texture diagnostic: save the fragment textures of the first few draws into the main scene target
+        // (1600x900 f0x3f, many draws) - if the scene's colour is black but its depth is written, the fragment
+        // shader is sampling black textures
+        if (stage == 1 && st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->format == 0x3f &&
+            st.rt.color[0]->width == 1600 && st.rt.color[0]->height == 900 && pass_draws > 5 && pass_draws <= 12 &&
+            tex.textureType == MTLTextureType2D) {
+            static int sn;
+            if (sn < 12) {
+                char path[128];
+                snprintf(path, sizeof path, "build/scenetex_%02d_%d.png", sn++, i);
+                renderer_save_texture(tex, path);
+            }
+        }
         if (stage == 0) { [enc setVertexTexture:tex atIndex:i]; [enc setVertexSamplerState:smp atIndex:i]; }
         else { [enc setFragmentTexture:tex atIndex:i]; [enc setFragmentSamplerState:smp atIndex:i]; }
     }
