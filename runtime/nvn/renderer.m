@@ -189,31 +189,34 @@ static void end_pass(void) {
             }
         }
         // auto-diagnostic: save the scene target (the 1600x900 f0x3f render target) after the first few passes that
-        // render into it - the scene itself, then the deferred lighting - to see where it turns black
+        // actually draw into it (draws > 0; plain clears are skipped) - the scene itself, then the deferred
+        // lighting - to see where it turns black
         if (st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->backend && st.rt.color[0]->format == 0x3f &&
             st.rt.color[0]->width == 1600 && st.rt.color[0]->height == 900) {
             static int nscene;
-            LOG("[diag] scene pass %d: target addr %llx draws %d depth %s\n", nscene, st.rt.color[0]->addr, pass_draws,
-                st.rt.depth ? "yes" : "no");
-            if (nscene < 4) {
-                id<MTLTexture> t = renderer_texture(st.rt.color[0], nil, true);
-                id<MTLCommandBuffer> c = cmdbuf;
-                cmdbuf = nil;
-                [c commit];
-                [c waitUntilCompleted];
-                char path[64];
-                snprintf(path, sizeof path, "build/scene_%d_%llx.png", nscene, st.rt.color[0]->addr);
-                renderer_save_texture(t, path);
-                if (st.rt.depth && st.rt.depth->backend) {
-                    id<MTLTexture> dt = renderer_texture(st.rt.depth, nil, true);
-                    id<MTLCommandBuffer> dc = cmdbuf;
+            if (pass_draws > 0) {
+                LOG("[diag] scene pass %d: target addr %llx draws %d depth %s\n", nscene, st.rt.color[0]->addr, pass_draws,
+                    st.rt.depth ? "yes" : "no");
+                if (nscene < 4) {
+                    id<MTLTexture> t = renderer_texture(st.rt.color[0], nil, true);
+                    id<MTLCommandBuffer> c = cmdbuf;
                     cmdbuf = nil;
-                    [dc commit];
-                    [dc waitUntilCompleted];
-                    snprintf(path, sizeof path, "build/scene_%d_depth.png", nscene);
-                    renderer_save_texture(dt, path);
+                    [c commit];
+                    [c waitUntilCompleted];
+                    char path[64];
+                    snprintf(path, sizeof path, "build/scene_%d_%llx.png", nscene, st.rt.color[0]->addr);
+                    renderer_save_texture(t, path);
+                    if (st.rt.depth && st.rt.depth->backend) {
+                        id<MTLTexture> dt = renderer_texture(st.rt.depth, nil, true);
+                        id<MTLCommandBuffer> dc = cmdbuf;
+                        cmdbuf = nil;
+                        [dc commit];
+                        [dc waitUntilCompleted];
+                        snprintf(path, sizeof path, "build/scene_%d_depth.png", nscene);
+                        renderer_save_texture(dt, path);
+                    }
+                    nscene++;
                 }
-                nscene++;
             }
         }
         pass_draws = 0;
