@@ -22,7 +22,7 @@ on:
 
 jobs:
   compile-check:
-    runs-on: macos-15
+    runs-on: macos-14
     timeout-minutes: 60
     permissions:
       contents: read
@@ -46,7 +46,7 @@ jobs:
   # linux/windows jobs may have created it first).
   dmg:
     if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'build-macos')
-    runs-on: macos-15
+    runs-on: macos-14
     timeout-minutes: 150
     permissions:
       contents: write
