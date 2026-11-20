@@ -187,6 +187,22 @@ static void end_pass(void) {
                 shot_rt = 0;  // once
             }
         }
+        // auto-diagnostic: save the scene target (the 1600x900 f0x3f render target) after the first few passes that
+        // render into it - the scene itself, then the deferred lighting - to see where it turns black
+        if (st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->backend && st.rt.color[0]->format == 0x3f &&
+            st.rt.color[0]->width == 1600 && st.rt.color[0]->height == 900) {
+            static int nscene;
+            if (nscene < 4) {
+                id<MTLTexture> t = renderer_texture(st.rt.color[0], nil, true);
+                id<MTLCommandBuffer> c = cmdbuf;
+                cmdbuf = nil;
+                [c commit];
+                [c waitUntilCompleted];
+                char path[64];
+                snprintf(path, sizeof path, "build/scene_%d.png", nscene++);
+                renderer_save_texture(t, path);
+            }
+        }
     }
 }
 
@@ -1109,10 +1125,14 @@ static id<MTLTexture> sampled_texture(NvnTexture *t, const NvnTextureView *v, bo
             tex = view_cached(src, 0x6000000000000000ull | 2, ^{ return [src newTextureViewWithPixelFormat:src.pixelFormat textureType:MTLTextureType2DArray levels:NSMakeRange(0, src.mipmapLevelCount) slices:NSMakeRange(0, 1)]; });
         else if (want == MTLTextureTypeCube && tex.textureType == MTLTextureType2DArray && tex.arrayLength >= 6)
             tex = view_cached(src, 0x6000000000000000ull | 3, ^{ return [src newTextureViewWithPixelFormat:src.pixelFormat textureType:MTLTextureTypeCube levels:NSMakeRange(0, src.mipmapLevelCount) slices:NSMakeRange(0, 6)]; });
-        else if (want == MTLTextureType2D && tex.textureType == MTLTextureType3D)
+        else if (want == MTLTextureType2D && tex.textureType == MTLTextureType3D) {
             // a 3D texture sampled as 2D (the scene's LUTs): the shader gives two coordinates, so the first depth
             // slice is what the hardware would use
+            static int n3d;
+            if (n3d++ < 20) LOG("[tex] 3D->2D view %ux%ux%u fmt %#x addr %llx\n", t->width, t->height, t->depth, t->format, t->addr);
             tex = view_cached(src, 0x6000000000000000ull | 4, ^{ return [src newTextureViewWithPixelFormat:src.pixelFormat textureType:MTLTextureType2D levels:NSMakeRange(0, src.mipmapLevelCount) slices:NSMakeRange(0, 1)]; });
+            if (n3d == 1 && tex.textureType == MTLTextureType2D) renderer_save_texture(tex, "build/lut3d_slice0.png");
+        }
         else {
             static int nlog;
             if (nlog++ < 30) LOG("[tex] type mismatch: want %lu have %lu (%ux%ux%u target %u fmt %#x arr %lu)\n", (unsigned long)want,
